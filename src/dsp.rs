@@ -44,11 +44,26 @@ pub struct Envelope {
     rel_rate: f32,
     hold: u32,
     done: bool,
+    /// Non-zero for live (keyboard) notes: `pitch + 1`, so note-off can find the voice.
+    tag: u16,
 }
 
 impl Envelope {
     pub fn new(hold_samples: u32) -> Self {
-        Self { stage: Stage::Attack, level: 0.0, rel_rate: 0.0, hold: hold_samples.max(1), done: false }
+        Self { stage: Stage::Attack, level: 0.0, rel_rate: 0.0, hold: hold_samples.max(1), done: false, tag: 0 }
+    }
+
+    /// Marks this envelope as a live note that sustains for `max_hold` samples or until released.
+    fn make_live(&mut self, key: u8, max_hold: u32) {
+        self.tag = u16::from(key) + 1;
+        self.hold = max_hold.max(1);
+    }
+
+    /// Starts the release stage if this is the live note for `key`.
+    fn release_key(&mut self, key: u8) {
+        if self.tag == u16::from(key) + 1 && self.stage != Stage::Release {
+            self.hold = 0;
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -490,6 +505,30 @@ impl NoteVoice {
                 | (NoteVoice::Sample(_), _)
                 | (NoteVoice::Drum(_), _)
         )
+    }
+
+    /// Turns a freshly created voice into a held keyboard note (sustains until `release_key`).
+    pub fn make_live(&mut self, key: u8, max_hold: u32) {
+        match self {
+            NoteVoice::Sub(v) => v.env.make_live(key, max_hold),
+            NoteVoice::Wt(v) => v.env.make_live(key, max_hold),
+            NoteVoice::Fm(v) => v.env.make_live(key, max_hold),
+            NoteVoice::Organ(v) => v.env.make_live(key, max_hold),
+            NoteVoice::Sample(v) => v.env.make_live(key, max_hold),
+            NoteVoice::Pluck(_) | NoteVoice::Drum(_) => {}
+        }
+    }
+
+    /// Releases the held keyboard note for `key`, if this voice is one.
+    pub fn release_key(&mut self, key: u8) {
+        match self {
+            NoteVoice::Sub(v) => v.env.release_key(key),
+            NoteVoice::Wt(v) => v.env.release_key(key),
+            NoteVoice::Fm(v) => v.env.release_key(key),
+            NoteVoice::Organ(v) => v.env.release_key(key),
+            NoteVoice::Sample(v) => v.env.release_key(key),
+            NoteVoice::Pluck(_) | NoteVoice::Drum(_) => {}
+        }
     }
 
     pub fn is_done(&self) -> bool {

@@ -286,13 +286,14 @@ impl BandCraftApp {
                 .track_mut(cref.track)
                 .and_then(|t| t.clips.iter_mut().find(|c| c.id == cref.clip))
             {
-                let mut bars = clip.length / 4.0;
-                let unit = if (bars - 1.0).abs() < 0.01 { " bar" } else { " bars" };
+                let mut beats = clip.length;
+                let unit = if (beats - 1.0).abs() < 0.01 { " beat" } else { " beats" };
                 if ui
-                    .add(egui::DragValue::new(&mut bars).range(1.0..=16.0).speed(0.1).fixed_decimals(0).suffix(unit))
+                    .add(egui::DragValue::new(&mut beats).range(1.0..=512.0).speed(0.25).fixed_decimals(0).suffix(unit))
+                    .on_hover_text("Clip length. You can also drag the right edge of a clip in the arrangement.")
                     .changed()
                 {
-                    clip.length = bars.round().max(1.0) * 4.0;
+                    clip.length = beats.round().max(1.0);
                 }
             }
             if ui.button("Clear").clicked() {

@@ -6,6 +6,7 @@
 mod audio;
 mod dsp;
 mod engine;
+mod midi;
 mod panels;
 mod project;
 mod roll;

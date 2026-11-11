@@ -2,6 +2,7 @@
 //! The inspector and piano-roll editor live in `panels.rs`.
 
 use crate::audio::{self, Recorder};
+use crate::midi::{self, MidiEvent, MidiIn};
 use crate::engine::{self, AudioCmd, MASTER_L, MASTER_R, METER_SLOTS, Meters};
 use crate::project::{
     AudioData, CATEGORIES, Clip, ClipContent, DRUM_KIT, INSTRUMENT_CATEGORIES, INSTRUMENT_PRESETS, Instrument, KitStyle,
@@ -35,6 +36,20 @@ pub(crate) struct ClipDrag {
     pub origins: Vec<(ClipRef, f32)>,
 }
 
+pub(crate) struct ClipResize {
+    pub clip: ClipRef,
+    /// Beats between the pointer and the clip's right edge when the drag began.
+    pub grab: f32,
+}
+
+/// A MIDI take in progress: notes land in `clip_id` on `track_id`.
+pub(crate) struct MidiRec {
+    pub track_id: u32,
+    pub clip_id: u32,
+    /// Held keys: pitch -> (start beat, velocity).
+    pub pending: std::collections::HashMap<u8, (f32, u8)>,
+}
+
 pub(crate) struct Marquee {
     pub start: Pos2,
     pub additive: bool,
@@ -55,6 +70,7 @@ pub(crate) enum Action {
     SelectTrack { id: u32, shift: bool },
     DeleteClips(Vec<ClipRef>),
     DeleteTracks,
+    ResizeClip { clip: ClipRef, length: f32 },
     DeleteTrack(u32),
     DuplicateTrack(u32),
     DuplicateClips(Vec<ClipRef>),
@@ -87,6 +103,11 @@ pub struct BandCraftApp {
     pub(crate) track_sel: Vec<u32>,
     pub(crate) clip_sel: Vec<ClipRef>,
     pub(crate) clip_drag: Option<ClipDrag>,
+    pub(crate) clip_resize: Option<ClipResize>,
+    pub(crate) midi: MidiIn,
+    pub(crate) midi_rec: Option<MidiRec>,
+    /// Keyboard notes currently sounding: pitch -> track they were sent to.
+    pub(crate) live_notes: std::collections::HashMap<u8, u32>,
     pub(crate) marquee: Option<Marquee>,
     pub(crate) selected_loop: Option<usize>,
     pub(crate) px_per_beat: f32,
@@ -152,6 +173,10 @@ impl BandCraftApp {
             track_sel: Vec::new(),
             clip_sel: Vec::new(),
             clip_drag: None,
+            clip_resize: None,
+            midi: MidiIn::new(),
+            midi_rec: None,
+            live_notes: std::collections::HashMap::new(),
             marquee: None,
             selected_loop: None,
             px_per_beat: 26.0,
@@ -490,6 +515,17 @@ impl BandCraftApp {
                 let ids = if self.track_sel.len() > 1 && self.track_sel.contains(&id) { self.track_sel.clone() } else { vec![id] };
                 self.delete_tracks(&ids);
             }
+            Action::ResizeClip { clip, length } => {
+                if let Some(c) = self
+                    .project
+                    .track_mut(clip.track)
+                    .and_then(|t| t.clips.iter_mut().find(|k| k.id == clip.clip))
+                {
+                    if matches!(c.content, ClipContent::Notes(_)) {
+                        c.length = length.clamp(1.0, 512.0);
+                    }
+                }
+            }
             Action::DuplicateTrack(id) => self.duplicate_track(id),
             Action::DuplicateClips(list) => self.duplicate_clips(&list),
             Action::NewClip { track, beat } => self.new_clip(track, beat),
@@ -748,6 +784,8 @@ impl BandCraftApp {
         self.selected_clip = None;
         self.selected_track = None;
         self.clip_drag = None;
+        self.clip_resize = None;
+        self.stop_midi_record();
         self.marquee = None;
         self.note_sel.clear();
         self.note_sel_clip = None;
@@ -779,6 +817,10 @@ impl BandCraftApp {
                 }
                 if ui.button("Export WAV").clicked() {
                     self.export();
+                    ui.close();
+                }
+                if ui.button("Export MIDI").clicked() {
+                    self.export_midi();
                     ui.close();
                 }
                 ui.separator();
@@ -837,6 +879,10 @@ impl BandCraftApp {
                     self.toggle_record();
                     ui.close();
                 }
+                if ui.add(egui::Button::new("Record MIDI").shortcut_text("Shift+R")).clicked() {
+                    self.toggle_midi_record();
+                    ui.close();
+                }
             });
             ui.menu_button("View", |ui| {
                 if ui.button("Zoom in").clicked() {
@@ -853,6 +899,8 @@ impl BandCraftApp {
                 }
             });
             ui.menu_button("Settings", |ui| {
+                self.midi_menu(ui);
+                ui.separator();
                 ui.label(format!("Output sample rate: {} Hz", self.sample_rate));
                 match &self.audio_error {
                     Some(e) => ui.colored_label(egui::Color32::YELLOW, format!("Audio output: {e}")),
@@ -871,6 +919,9 @@ impl BandCraftApp {
                     "Ctrl+A select all   Ctrl+D duplicate   Esc clear",
                     "Piano roll: click to add notes, drag to box-select, right-click deletes",
                     "Piano roll: arrows nudge selected notes, Q quantizes",
+                    "Drag a note clip's right edge to resize it",
+                    "MIDI keyboard: plays the selected track; Shift+R records MIDI into it",
+                    "Loops tab: import .mid files; File > Export MIDI saves one",
                 ] {
                     ui.label(line);
                 }
@@ -884,6 +935,240 @@ impl BandCraftApp {
                 );
             });
         });
+    }
+
+    // ----- MIDI ----------------------------------------------------------------------
+
+    /// Menu content for choosing the MIDI input device.
+    fn midi_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        ui.label(RichText::new("MIDI INPUT").size(10.0).strong().color(theme::TEXT_DIM));
+        if self.midi.ports.is_empty() {
+            ui.label("No MIDI keyboard found");
+        }
+        let ports = self.midi.ports.clone();
+        for name in ports {
+            let on = self.midi.connected.as_deref() == Some(name.as_str());
+            if ui.selectable_label(on, &name).clicked() {
+                self.midi.connect(&name);
+                self.status = match &self.midi.error {
+                    Some(e) => format!("MIDI: {e}"),
+                    None => format!("MIDI keyboard connected: {name}"),
+                };
+                ui.close();
+            }
+        }
+        if let Some(e) = &self.midi.error {
+            ui.colored_label(Color32::YELLOW, e);
+        }
+        ui.separator();
+        if ui.button("Rescan devices").clicked() {
+            self.midi.rescan();
+        }
+        if self.midi.connected.is_some() && ui.button("Disconnect").clicked() {
+            self.midi.disconnect();
+            ui.close();
+        }
+    }
+
+    /// Handles keyboard notes: plays them on the selected track and records them if a take is running.
+    fn pump_midi(&mut self) {
+        let events: Vec<MidiEvent> = self.midi.rx.try_iter().collect();
+        if let Some(rec) = &self.midi_rec {
+            // Keep the take long enough to cover the playhead.
+            let beat = self.playhead_beats();
+            let (tid, cid) = (rec.track_id, rec.clip_id);
+            if let Some(clip) = self.project.track_mut(tid).and_then(|t| t.clips.iter_mut().find(|c| c.id == cid)) {
+                let need = (((beat - clip.start) / 4.0).ceil() * 4.0).max(4.0);
+                if need > clip.length {
+                    clip.length = need;
+                }
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let target = self
+            .midi_rec
+            .as_ref()
+            .map(|r| r.track_id)
+            .or_else(|| self.selected_track.filter(|t| self.project.track(*t).is_some_and(|tr| tr.kind != TrackKind::Audio)));
+        let Some(track_id) = target else {
+            return;
+        };
+        let drums = self.project.track(track_id).is_some_and(|t| t.kind == TrackKind::Drums);
+        let beat = self.playhead_beats();
+        for ev in events {
+            let pitch = if drums {
+                match midi::gm_drum_to_kit(ev.pitch) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                ev.pitch
+            };
+            if ev.on {
+                self.live_notes.insert(pitch, track_id);
+                self.send(AudioCmd::NoteOn { track: track_id, pitch, vel: ev.vel });
+                if let Some(rec) = &mut self.midi_rec {
+                    rec.pending.insert(pitch, (beat, ev.vel));
+                }
+            } else {
+                let t = self.live_notes.remove(&pitch).unwrap_or(track_id);
+                self.send(AudioCmd::NoteOff { track: t, pitch });
+                self.finish_midi_note(pitch, beat);
+            }
+        }
+    }
+
+    fn finish_midi_note(&mut self, pitch: u8, end_beat: f32) {
+        let Some(rec) = &mut self.midi_rec else {
+            return;
+        };
+        let Some((start, vel)) = rec.pending.remove(&pitch) else {
+            return;
+        };
+        let (tid, cid) = (rec.track_id, rec.clip_id);
+        let drums = self.project.track(tid).is_some_and(|t| t.kind == TrackKind::Drums);
+        if let Some(clip) = self.project.track_mut(tid).and_then(|t| t.clips.iter_mut().find(|c| c.id == cid)) {
+            let rel = (start - clip.start).max(0.0);
+            let len = if drums { 0.25 } else { (end_beat - start).max(0.05) };
+            let stored = if drums { pitch } else { midi::fold_pitch(i32::from(pitch)) };
+            if let ClipContent::Notes(notes) = &mut clip.content {
+                notes.push(Note { pitch: stored, start: rel, length: len, velocity: vel.max(1) });
+            }
+            let need = ((rel + len) / 4.0).ceil() * 4.0;
+            if need > clip.length {
+                clip.length = need;
+            }
+        }
+    }
+
+    pub(crate) fn toggle_midi_record(&mut self) {
+        if self.midi_rec.is_some() {
+            self.stop_midi_record();
+            return;
+        }
+        let Some(tid) = self
+            .selected_track
+            .filter(|t| self.project.track(*t).is_some_and(|tr| tr.kind != TrackKind::Audio))
+        else {
+            self.status = "Select a synth or drum track first, then press Shift+R to record MIDI.".into();
+            return;
+        };
+        if self.midi.connected.is_none() {
+            self.status = "No MIDI keyboard connected. Plug one in, then choose it in Settings > MIDI input.".into();
+            return;
+        }
+        if self.recording.is_some() {
+            self.stop_recording();
+        }
+        if self.playhead_beats() >= self.project.song_beats() {
+            self.seek_beats(0.0);
+        }
+        let start = (self.playhead_beats() / 4.0).floor().max(0.0) * 4.0;
+        let clip_id = self.project.alloc_id();
+        let count = self.project.track(tid).map_or(0, |t| t.clips.len()) + 1;
+        if let Some(t) = self.project.track_mut(tid) {
+            t.clips.push(Clip {
+                id: clip_id,
+                name: format!("MIDI take {count}"),
+                start,
+                length: 4.0,
+                content: ClipContent::Notes(Vec::new()),
+            });
+        }
+        self.midi_rec = Some(MidiRec { track_id: tid, clip_id, pending: std::collections::HashMap::new() });
+        self.select_clip(ClipRef { track: tid, clip: clip_id });
+        if !self.is_playing() {
+            self.send(AudioCmd::Play);
+        }
+        self.status = "Recording MIDI: play your keyboard. Press Shift+R or the MIDI button to stop.".into();
+    }
+
+    pub(crate) fn stop_midi_record(&mut self) {
+        if self.midi_rec.is_none() {
+            return;
+        }
+        let beat = self.playhead_beats();
+        let held: Vec<u8> = self.midi_rec.as_ref().map(|r| r.pending.keys().copied().collect()).unwrap_or_default();
+        for p in held {
+            self.finish_midi_note(p, beat);
+        }
+        let Some(rec) = self.midi_rec.take() else {
+            return;
+        };
+        self.send(AudioCmd::Stop);
+        let count = self
+            .project
+            .track(rec.track_id)
+            .and_then(|t| t.clips.iter().find(|c| c.id == rec.clip_id))
+            .map(|c| match &c.content {
+                ClipContent::Notes(n) => n.len(),
+                ClipContent::Audio { .. } => 0,
+            });
+        match count {
+            Some(0) => {
+                self.project.remove_clip(rec.track_id, rec.clip_id);
+                self.status = "No notes were played, so the MIDI take was discarded.".into();
+            }
+            Some(n) => self.status = format!("Recorded {n} MIDI note(s). Press Q in the piano roll to quantize."),
+            None => {}
+        }
+    }
+
+    pub(crate) fn import_midi(&mut self, path: &str) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Cannot read {path}: {e}");
+                return;
+            }
+        };
+        let imp = match midi::import_smf(&bytes) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        if self.project.tracks.is_empty() {
+            if let Some(b) = imp.bpm {
+                self.project.bpm = b.round();
+            }
+        }
+        let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("MIDI").to_string();
+        let count = imp.tracks.len();
+        let mut first = None;
+        for t in imp.tracks {
+            let (kind, inst) = if t.drums {
+                (TrackKind::Drums, Instrument::default_drum_kit())
+            } else {
+                (TrackKind::Synth, Instrument::preset(midi::preset_for_program(t.program)).unwrap_or_default())
+            };
+            let id = self.project.add_track_with(&t.name, kind, inst);
+            let end = t.notes.iter().map(|n| n.start + n.length).fold(0.0f32, f32::max);
+            let length = ((end / 4.0).ceil() * 4.0).max(4.0);
+            let clip_id = self.project.alloc_id();
+            if let Some(track) = self.project.track_mut(id) {
+                track.clips.push(Clip { id: clip_id, name: stem.clone(), start: 0.0, length, content: ClipContent::Notes(t.notes) });
+            }
+            first.get_or_insert(ClipRef { track: id, clip: clip_id });
+        }
+        if let Some(c) = first {
+            self.select_clip(c);
+        }
+        self.seek_beats(0.0);
+        self.status = format!("Imported {count} track(s) from {stem}.mid");
+    }
+
+    pub(crate) fn export_midi(&mut self) {
+        let path = Path::new(&self.export_path).with_extension("mid");
+        let bytes = midi::export_smf(&self.project);
+        match std::fs::write(&path, bytes) {
+            Ok(()) => self.status = format!("Exported MIDI to {}", path.display()),
+            Err(e) => self.status = format!("MIDI export failed: {e}"),
+        }
     }
 
     /// Deletes selected notes (when the piano roll has focus), else selected clips, else selected tracks.
@@ -916,6 +1201,9 @@ impl BandCraftApp {
                 let _ = rec.recorder.finish();
             }
             self.send(AudioCmd::Stop);
+        }
+        if self.midi_rec.as_ref().is_some_and(|r| ids.contains(&r.track_id)) {
+            self.stop_midi_record();
         }
         for &id in ids {
             self.project.remove_track(id);
@@ -1040,9 +1328,34 @@ impl BandCraftApp {
                 self.send(AudioCmd::Stop);
                 self.seek_beats(0.0);
             }
-            if theme::round_button(ui, Icon::Record, theme::RECORD, "Record from input (R)", recording).clicked() {
+            if theme::round_button(ui, Icon::Record, theme::RECORD, "Record audio from the microphone (R)", recording).clicked() {
                 self.toggle_record();
             }
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                let on = self.midi_rec.is_some();
+                let label = if on { "■ MIDI" } else { "● MIDI" };
+                let btn = egui::Button::new(RichText::new(label).strong().size(11.5).color(if on { theme::WINDOW_BG } else { theme::RECORD }))
+                    .fill(if on { theme::RECORD } else { theme::SURFACE })
+                    .min_size(Vec2::new(64.0, 18.0));
+                if ui
+                    .add(btn)
+                    .on_hover_text("Record notes from your MIDI keyboard into the selected synth or drum track (Shift+R)")
+                    .clicked()
+                {
+                    self.toggle_midi_record();
+                }
+                let dot = if self.midi.connected.is_some() { theme::ACCENT } else { theme::TEXT_DIM };
+                let name = self.midi.connected.clone().unwrap_or_else(|| "no keyboard".to_string());
+                let short: String = name.chars().take(10).collect();
+                let resp = ui.add(
+                    egui::Button::new(RichText::new(format!("● {short}")).size(10.0).color(dot))
+                        .frame(false)
+                        .min_size(Vec2::new(64.0, 14.0)),
+                );
+                let resp = resp.on_hover_text("MIDI input: click to choose a device");
+                egui::Popup::menu(&resp).show(|ui| self.midi_menu(ui));
+            });
 
             ui.add_space(12.0);
             self.clock_ui(ui);
@@ -1249,17 +1562,22 @@ impl BandCraftApp {
             }
         });
 
-        theme::caption(ui, "Import audio");
+        theme::caption(ui, "Import audio / MIDI");
         ui.horizontal(|ui| {
             let row_w = ui.available_width();
             ui.add(
                 egui::TextEdit::singleline(&mut self.import_path)
-                    .hint_text("path to a .wav file")
+                    .hint_text("path to a .wav or .mid file")
                     .desired_width((row_w - 96.0).max(60.0)),
             );
             if ui.button("Import").clicked() {
                 let path = self.import_path.clone();
-                self.import_wav(&path);
+                let lower = path.to_lowercase();
+                if lower.ends_with(".mid") || lower.ends_with(".midi") {
+                    self.import_midi(&path);
+                } else {
+                    self.import_wav(&path);
+                }
             }
         });
 
@@ -1316,6 +1634,7 @@ impl BandCraftApp {
         let pointer_down = ui.input(|i| i.pointer.primary_down());
         if !pointer_down {
             self.clip_drag = None;
+            self.clip_resize = None;
         }
         let zoom = ui.input(|i| i.zoom_delta());
         if (zoom - 1.0).abs() > 1e-4 && ui.rect_contains_pointer(ui.max_rect()) {
@@ -1339,6 +1658,7 @@ impl BandCraftApp {
         let armed: Option<&'static LoopDef> = self.selected_loop.and_then(|i| LIBRARY.get(i));
         let project = &mut self.project;
         let clip_drag = &mut self.clip_drag;
+        let clip_resize = &mut self.clip_resize;
         let marquee = &mut self.marquee;
 
         let actions = egui::ScrollArea::both()
@@ -1531,9 +1851,17 @@ impl BandCraftApp {
                         draw_clip(&p, r, clip, track.kind, base, ppb, bpm, selected);
                         clip_rects.push((cref, r));
 
+                        let is_notes = matches!(clip.content, ClipContent::Notes(_));
+                        let edge_x = r.right() - 9.0;
+                        let can_resize = is_notes && r.width() > 24.0;
                         let resp = ui.interact(r, ui.scope_id().with(("clip", clip.id)), Sense::click_and_drag());
                         if resp.hovered() && !pointer_down {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                            let on_edge = can_resize && resp.hover_pos().is_some_and(|h| h.x >= edge_x);
+                            ui.ctx().set_cursor_icon(if on_edge {
+                                egui::CursorIcon::ResizeHorizontal
+                            } else {
+                                egui::CursorIcon::Grab
+                            });
                         }
                         if resp.clicked() {
                             actions.push(Action::ClickClip { clip: cref, shift });
@@ -1542,45 +1870,63 @@ impl BandCraftApp {
                             actions.push(Action::ClickClip { clip: cref, shift: false });
                         }
                         if resp.drag_started() {
-                            let mut origins = Vec::new();
-                            // Dragging an unselected clip (without shift) replaces the selection.
-                            let base_sel: Vec<ClipRef> = if clip_sel.contains(&cref) || shift {
-                                clip_sel.clone()
+                            let press = ui.input(|i| i.pointer.press_origin());
+                            if can_resize && press.is_some_and(|p| p.x >= edge_x) {
+                                // Dragging the right edge resizes the clip.
+                                if let Some(pos) = press {
+                                    *clip_resize = Some(ClipResize { clip: cref, grab: beat_at(pos.x) - (clip.start + clip.length) });
+                                }
+                                *clip_drag = None;
+                                if !clip_sel.contains(&cref) {
+                                    actions.push(Action::ClickClip { clip: cref, shift: false });
+                                }
                             } else {
-                                vec![cref]
-                            };
-                            if !clip_sel.contains(&cref) && !shift {
-                                actions.push(Action::ClickClip { clip: cref, shift: false });
-                            }
-                            for t in project.tracks.iter() {
-                                for k in &t.clips {
-                                    let kr = ClipRef { track: t.id, clip: k.id };
-                                    if base_sel.contains(&kr) || kr == cref {
-                                        origins.push((kr, k.start));
+                                let mut origins = Vec::new();
+                                // Dragging an unselected clip (without shift) replaces the selection.
+                                let base_sel: Vec<ClipRef> = if clip_sel.contains(&cref) || shift {
+                                    clip_sel.clone()
+                                } else {
+                                    vec![cref]
+                                };
+                                if !clip_sel.contains(&cref) && !shift {
+                                    actions.push(Action::ClickClip { clip: cref, shift: false });
+                                }
+                                for t in project.tracks.iter() {
+                                    for k in &t.clips {
+                                        let kr = ClipRef { track: t.id, clip: k.id };
+                                        if base_sel.contains(&kr) || kr == cref {
+                                            origins.push((kr, k.start));
+                                        }
                                     }
                                 }
-                            }
-                            if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
-                                *clip_drag = Some(ClipDrag { clip: cref, grab: beat_at(pos.x) - clip.start, origins });
+                                if let Some(pos) = press {
+                                    *clip_drag = Some(ClipDrag { clip: cref, grab: beat_at(pos.x) - clip.start, origins });
+                                }
                             }
                         }
                         if resp.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                            if let (Some(d), Some(pos)) = (clip_drag.as_ref(), resp.interact_pointer_pos()) {
-                                if d.clip == cref {
-                                    let primary_origin = d.origins.iter().find(|(c, _)| *c == cref).map_or(clip.start, |o| o.1);
-                                    let new_primary = (beat_at(pos.x) - d.grab).round().max(0.0);
-                                    let delta = new_primary - primary_origin;
-                                    let moves = d
-                                        .origins
-                                        .iter()
-                                        .map(|(c, s)| (*c, (s + delta).max(0.0)))
-                                        .collect();
-                                    actions.push(Action::MoveClips(moves));
+                            let resizing = clip_resize.as_ref().is_some_and(|z| z.clip == cref);
+                            if let (true, Some(pos), Some(z)) = (resizing, resp.interact_pointer_pos(), clip_resize.as_ref()) {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                                let length = (beat_at(pos.x) - z.grab - clip.start).round().max(1.0);
+                                actions.push(Action::ResizeClip { clip: cref, length });
+                            } else if !resizing {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                if let (Some(d), Some(pos)) = (clip_drag.as_ref(), resp.interact_pointer_pos()) {
+                                    if d.clip == cref {
+                                        let primary_origin = d.origins.iter().find(|(c, _)| *c == cref).map_or(clip.start, |o| o.1);
+                                        let new_primary = (beat_at(pos.x) - d.grab).round().max(0.0);
+                                        let delta = new_primary - primary_origin;
+                                        let moves = d
+                                            .origins
+                                            .iter()
+                                            .map(|(c, s)| (*c, (s + delta).max(0.0)))
+                                            .collect();
+                                        actions.push(Action::MoveClips(moves));
+                                    }
                                 }
                             }
                         }
-                        let is_notes = matches!(clip.content, ClipContent::Notes(_));
                         resp.context_menu(|ui| {
                             ui.set_min_width(190.0);
                             let targets: Vec<ClipRef> = if clip_sel.contains(&cref) { clip_sel.clone() } else { vec![cref] };
@@ -1970,7 +2316,8 @@ impl eframe::App for BandCraftApp {
                     undo: cmd && !shift && i.key_pressed(Key::Z),
                     redo: (cmd && i.key_pressed(Key::Y)) || (cmd && shift && i.key_pressed(Key::Z)),
                     delete: i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-                    record: i.key_pressed(Key::R) && !cmd,
+                    record: i.key_pressed(Key::R) && !cmd && !shift,
+                    midi_record: i.key_pressed(Key::R) && !cmd && shift,
                     save: cmd && i.key_pressed(Key::S),
                     home: i.key_pressed(Key::Home),
                     select_all: cmd && i.key_pressed(Key::A),
@@ -1994,6 +2341,9 @@ impl eframe::App for BandCraftApp {
             }
             if keys.record {
                 self.toggle_record();
+            }
+            if keys.midi_record {
+                self.toggle_midi_record();
             }
             if keys.save {
                 self.save();
@@ -2063,6 +2413,8 @@ impl eframe::App for BandCraftApp {
             ctx.request_repaint();
         }
 
+        self.midi.set_context(ctx);
+        self.pump_midi();
         self.send(AudioCmd::SetProject(Arc::new(self.project.clone())));
         if self.is_playing() {
             ctx.request_repaint();
@@ -2111,6 +2463,7 @@ struct Keys {
     redo: bool,
     delete: bool,
     record: bool,
+    midi_record: bool,
     save: bool,
     home: bool,
     select_all: bool,
@@ -2210,6 +2563,16 @@ fn draw_clip(p: &Painter, r: Rect, clip: &Clip, kind: TrackKind, base: Color32, 
         }
         ClipContent::Audio { data: Some(d), .. } => draw_wave(&cp, area, d, bpm, ppb),
         ClipContent::Audio { data: None, .. } => {}
+    }
+    if matches!(clip.content, ClipContent::Notes(_)) && r.width() > 24.0 {
+        let x = r.right() - 5.0;
+        let cy = r.center().y + 9.0;
+        for dx in [-1.5, 1.5] {
+            p.line_segment(
+                [Pos2::new(x + dx, cy - 7.0), Pos2::new(x + dx, cy + 7.0)],
+                Stroke::new(1.0, Color32::from_white_alpha(96)),
+            );
+        }
     }
     if selected {
         p.rect_stroke(r.expand(2.5), 10.0, Stroke::new(2.0, Color32::from_rgba_unmultiplied(52, 211, 196, 120)), StrokeKind::Outside);

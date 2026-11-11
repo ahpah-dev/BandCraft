@@ -46,6 +46,9 @@ impl Meters {
 pub enum AudioCmd {
     /// Audition a note on a track.
     Preview { track: u32, pitch: u8 },
+    /// Live keyboard note: sounds until the matching `NoteOff`.
+    NoteOn { track: u32, pitch: u8, vel: u8 },
+    NoteOff { track: u32, pitch: u8 },
     SetProject(Arc<Project>),
     Play,
     Stop,
@@ -145,6 +148,33 @@ impl Renderer {
         }
     }
 
+    /// Starts a held keyboard note (released by `note_off`, or after at most 20 seconds).
+    pub fn note_on(&mut self, project: &Project, track_id: u32, pitch: u8, vel: u8) {
+        self.sync(project);
+        let Some(track) = project.track(track_id) else { return };
+        if track.kind == TrackKind::Audio {
+            return;
+        }
+        let one_shot = matches!(track.instrument, Instrument::DrumKit { .. });
+        let max_hold = (self.sr * 20.0) as u32;
+        let hold = if one_shot { (self.sr * 0.35) as u32 } else { max_hold };
+        let voice = NoteVoice::new(&track.instrument, pitch, f32::from(vel.max(1)) / 127.0, hold, self.sr, &mut self.rng);
+        if let Some(mut v) = voice {
+            if !one_shot {
+                v.make_live(pitch, max_hold);
+            }
+            self.push_voice(track_id, v);
+        }
+    }
+
+    pub fn note_off(&mut self, track_id: u32, pitch: u8) {
+        if let Some(rt) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            for v in &mut rt.voices {
+                v.release_key(pitch);
+            }
+        }
+    }
+
     /// Returns and clears the loudest output sample of a track since the last call.
     pub fn take_peak(&mut self, track_id: u32) -> f32 {
         self.tracks
@@ -222,6 +252,9 @@ impl Renderer {
                     continue;
                 };
                 for note in notes {
+                    if note.start >= clip.length {
+                        continue; // trimmed off the end of the clip
+                    }
                     let s = ((f64::from(clip.start) + f64::from(note.start)) * spb).round() as u64;
                     if s < start || s >= end {
                         continue;
@@ -457,6 +490,8 @@ impl Engine {
             match cmd {
                 AudioCmd::SetProject(p) => self.project = p,
                 AudioCmd::Preview { track, pitch } => self.renderer.preview(&self.project, track, pitch),
+                AudioCmd::NoteOn { track, pitch, vel } => self.renderer.note_on(&self.project, track, pitch, vel),
+                AudioCmd::NoteOff { track, pitch } => self.renderer.note_off(track, pitch),
                 AudioCmd::Play => self.renderer.play(&self.project),
                 AudioCmd::Stop => self.renderer.stop(),
                 AudioCmd::Seek(p) => self.renderer.seek(p),
