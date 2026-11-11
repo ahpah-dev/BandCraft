@@ -2,6 +2,8 @@
 
 An easy, BandLab-style music studio written in Rust (egui + cpal). Pick a loop, drop it on a track, tweak the sound, record, and export a WAV.
 
+![BandCraft screenshot](docs/screenshot.png)
+
 ## Run
 
 ```bash
