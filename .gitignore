@@ -1,0 +1,5 @@
+/target
+/recordings
+/instruments
+*.bandcraft.json
+my_song.wav
