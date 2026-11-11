@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 
 pub(crate) const HEADER_W: f32 = 232.0;
-pub(crate) const RULER_H: f32 = 26.0;
-pub(crate) const LANE_H: f32 = 76.0;
+pub(crate) const RULER_H: f32 = 28.0;
+pub(crate) const LANE_H: f32 = 84.0;
 pub(crate) const USER_INSTRUMENT_DIR: &str = "instruments";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,6 +55,12 @@ pub(crate) enum Action {
     SelectTrack { id: u32, shift: bool },
     DeleteClips(Vec<ClipRef>),
     DeleteTracks,
+    DeleteTrack(u32),
+    DuplicateTrack(u32),
+    DuplicateClips(Vec<ClipRef>),
+    NewClip { track: u32, beat: f32 },
+    Rename(Option<u32>),
+    Record,
     AddTrack(TrackKind),
     Seek(f32),
     ToggleMute(u32),
@@ -110,6 +116,9 @@ pub struct BandCraftApp {
     pub(crate) sounds_tab: u8,
     pub(crate) instrument_search: String,
     pub(crate) editor_focus: bool,
+    /// True after a track header was clicked: Delete then removes tracks instead of clips.
+    pub(crate) track_focus: bool,
+    pub(crate) renaming: Option<u32>,
     pub(crate) status: String,
 }
 
@@ -144,7 +153,7 @@ impl BandCraftApp {
             clip_sel: Vec::new(),
             clip_drag: None,
             marquee: None,
-            selected_loop: Some(0),
+            selected_loop: None,
             px_per_beat: 26.0,
             loop_on: true,
             metronome_on: false,
@@ -171,7 +180,9 @@ impl BandCraftApp {
             sounds_tab: 1,
             instrument_search: String::new(),
             editor_focus: false,
-            status: "Pick a loop, then click a track lane to place it. Shift-click to multi-select.".into(),
+            track_focus: false,
+            renaming: None,
+            status: "Double-click a lane to add a clip, or click a loop then a lane. Click a track and press Delete to remove it.".into(),
         };
         app.refresh_user_instruments();
         app
@@ -289,6 +300,7 @@ impl BandCraftApp {
         self.selected_track = Some(c.track);
         self.track_sel = vec![c.track];
         self.editor_focus = false;
+        self.track_focus = false;
     }
 
     pub(crate) fn clip_exists(&self, c: ClipRef) -> bool {
@@ -352,11 +364,25 @@ impl BandCraftApp {
         let lp: &LoopDef = &LIBRARY[idx];
         let compatible = self.project.track(track_id).is_some_and(|t| t.kind == lp.kind());
         if !compatible {
-            self.status = format!("'{}' needs a {} track", lp.name, kind_label(lp.kind()));
+            self.status = format!(
+                "'{}' is a {} loop: click a {} lane, or double-click the loop to give it a new track.",
+                lp.name,
+                kind_label(lp.kind()),
+                kind_label(lp.kind())
+            );
             return;
         }
-        let id = self.project.place_loop(track_id, lp, beat.round().max(0.0));
+        let start = (beat / 4.0).floor().max(0.0) * 4.0;
+        let existing = self
+            .project
+            .track(track_id)
+            .and_then(|t| t.clips.iter().find(|c| (c.start - start).abs() < 0.01 && c.name == lp.name).map(|c| c.id));
+        let id = match existing {
+            Some(id) => id,
+            None => self.project.place_loop(track_id, lp, start),
+        };
         self.select_clip(ClipRef { track: track_id, clip: id });
+        self.status = format!("Placed '{}'. Keep clicking lanes to place more, Esc to stop.", lp.name);
     }
 
     pub(crate) fn import_wav(&mut self, path: &str) {
@@ -402,6 +428,7 @@ impl BandCraftApp {
                 } else {
                     self.select_clip(clip);
                 }
+                self.track_focus = false;
             }
             Action::MoveClips(moves) => {
                 for (c, start) in moves {
@@ -432,6 +459,7 @@ impl BandCraftApp {
             }
             Action::LaneClick { track, beat } => {
                 self.select_only_track(track);
+                self.track_focus = false;
                 self.clip_sel.clear();
                 self.editor_focus = false;
                 match self.selected_loop {
@@ -440,6 +468,8 @@ impl BandCraftApp {
                 }
             }
             Action::SelectTrack { id, shift } => {
+                self.track_focus = true;
+                self.editor_focus = false;
                 if shift {
                     if let Some(i) = self.track_sel.iter().position(|t| *t == id) {
                         self.track_sel.remove(i);
@@ -454,14 +484,17 @@ impl BandCraftApp {
             Action::DeleteClips(list) => self.delete_clips(&list),
             Action::DeleteTracks => {
                 let ids = self.selected_track_ids();
-                for id in ids {
-                    self.project.remove_track(id);
-                }
-                self.track_sel.clear();
-                self.selected_track = None;
-                self.selected_clip = None;
-                self.clip_sel.clear();
+                self.delete_tracks(&ids);
             }
+            Action::DeleteTrack(id) => {
+                let ids = if self.track_sel.len() > 1 && self.track_sel.contains(&id) { self.track_sel.clone() } else { vec![id] };
+                self.delete_tracks(&ids);
+            }
+            Action::DuplicateTrack(id) => self.duplicate_track(id),
+            Action::DuplicateClips(list) => self.duplicate_clips(&list),
+            Action::NewClip { track, beat } => self.new_clip(track, beat),
+            Action::Rename(r) => self.renaming = r,
+            Action::Record => self.toggle_record(),
             Action::AddTrack(kind) => self.add_track(kind),
             Action::Seek(beat) => self.seek_beats(beat),
             Action::ToggleMute(id) => {
@@ -505,11 +538,19 @@ impl BandCraftApp {
     }
 
     /// Duplicates every selected clip directly after itself and selects the copies.
-    fn duplicate_selection(&mut self) {
+    pub(crate) fn duplicate_selection(&mut self) {
+        let list: Vec<ClipRef> = if self.clip_sel.is_empty() {
+            self.selected_clip.into_iter().collect()
+        } else {
+            self.clip_sel.clone()
+        };
+        self.duplicate_clips(&list);
+    }
+
+    fn duplicate_clips(&mut self, list: &[ClipRef]) {
         let bpm = self.project.bpm;
         let mut new_sel = Vec::new();
-        let sources: Vec<(ClipRef, Clip)> = self
-            .clip_sel
+        let sources: Vec<(ClipRef, Clip)> = list
             .iter()
             .filter_map(|c| {
                 self.project
@@ -529,8 +570,10 @@ impl BandCraftApp {
             }
             new_sel.push(ClipRef { track: c.track, clip: id });
         }
-        if !new_sel.is_empty() {
-            self.selected_clip = new_sel.last().copied();
+        if let Some(last) = new_sel.last().copied() {
+            self.selected_clip = Some(last);
+            self.selected_track = Some(last.track);
+            self.track_sel = vec![last.track];
             self.clip_sel = new_sel;
             self.status = format!("Duplicated {} clip(s)", self.clip_sel.len());
         }
@@ -661,14 +704,12 @@ impl BandCraftApp {
                     }
                     load_instrument_samples(&mut track.instrument, &mut missing);
                 }
+                self.reset_ui_state();
                 self.project = project;
                 self.undo.clear();
                 self.redo.clear();
                 self.snapshot = self.project.clone();
-                self.clip_sel.clear();
-                self.track_sel.clear();
-                self.selected_clip = None;
-                self.selected_track = None;
+                self.seek_beats(0.0);
                 self.status = if missing > 0 {
                     format!("Opened, but {missing} audio file(s) could not be found")
                 } else {
@@ -690,12 +731,31 @@ impl BandCraftApp {
     }
 
     fn new_project(&mut self) {
+        self.reset_ui_state();
         self.project = Project::empty();
-        self.track_sel.clear();
+        self.seek_beats(0.0);
+        self.status = "New project. Add a track with + Track or pick an instrument on the left.".into();
+    }
+
+    /// Forgets every selection, drag and in-progress recording (used when the project is replaced).
+    fn reset_ui_state(&mut self) {
+        if let Some(rec) = self.recording.take() {
+            let _ = rec.recorder.finish();
+            self.send(AudioCmd::Stop);
+        }
         self.clip_sel.clear();
-        self.selected_track = None;
+        self.track_sel.clear();
         self.selected_clip = None;
-        self.status = "New project".into();
+        self.selected_track = None;
+        self.clip_drag = None;
+        self.marquee = None;
+        self.note_sel.clear();
+        self.note_sel_clip = None;
+        self.note_op = None;
+        self.roll_for_clip = None;
+        self.renaming = None;
+        self.track_focus = false;
+        self.editor_focus = false;
     }
 
     // ----- panels --------------------------------------------------------------------
@@ -703,10 +763,8 @@ impl BandCraftApp {
     fn menu_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
-            if ui.button("Exit").clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
             ui.menu_button("File", |ui| {
+                ui.set_min_width(210.0);
                 if ui.button("New project").clicked() {
                     self.new_project();
                     ui.close();
@@ -715,7 +773,7 @@ impl BandCraftApp {
                     self.open();
                     ui.close();
                 }
-                if ui.button("Save").clicked() {
+                if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
                     self.save();
                     ui.close();
                 }
@@ -723,26 +781,60 @@ impl BandCraftApp {
                     self.export();
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Undo    Ctrl+Z").clicked() {
+                ui.set_min_width(230.0);
+                if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
                     self.undo();
                     ui.close();
                 }
-                if ui.button("Redo    Ctrl+Y").clicked() {
+                if ui.add(egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() {
                     self.redo();
                     ui.close();
                 }
-                if ui.button("Select all    Ctrl+A").clicked() {
+                ui.separator();
+                if ui.add(egui::Button::new("Select all").shortcut_text("Ctrl+A")).clicked() {
                     self.select_all();
                     ui.close();
                 }
-                if ui.button("Duplicate    Ctrl+D").clicked() {
-                    self.duplicate_selection();
+                if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+                    if self.editor_focus {
+                        self.duplicate_notes();
+                    } else {
+                        self.duplicate_selection();
+                    }
                     ui.close();
                 }
-                if ui.button("Clear selection    Esc").clicked() {
+                if ui.add(egui::Button::new("Delete selection").shortcut_text("Del")).clicked() {
+                    self.delete_selection();
+                    ui.close();
+                }
+                if ui.button("Delete selected track(s)").clicked() {
+                    let ids = self.selected_track_ids();
+                    self.delete_tracks(&ids);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Clear selection").shortcut_text("Esc")).clicked() {
                     self.clear_selection();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Track", |ui| {
+                ui.set_min_width(200.0);
+                if ui.button("Add synth track").clicked() {
+                    self.add_track(TrackKind::Synth);
+                    ui.close();
+                }
+                if ui.button("Add drum kit track").clicked() {
+                    self.add_track(TrackKind::Drums);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Record audio").shortcut_text("R")).clicked() {
+                    self.toggle_record();
                     ui.close();
                 }
             });
@@ -753,6 +845,10 @@ impl BandCraftApp {
                 }
                 if ui.button("Zoom out").clicked() {
                     self.px_per_beat = (self.px_per_beat / 1.25).max(8.0);
+                    ui.close();
+                }
+                if ui.button("Reset zoom").clicked() {
+                    self.px_per_beat = 26.0;
                     ui.close();
                 }
             });
@@ -766,13 +862,15 @@ impl BandCraftApp {
             ui.menu_button("Help", |ui| {
                 for line in [
                     "Space: play / pause      R: record",
-                    "Click: select   Shift+click: add/remove",
-                    "Drag empty space: box select",
-                    "Drag clips: move the whole selection",
+                    "Double-click a lane: add an empty clip",
+                    "Click a loop on the left, then click a lane to place it (Esc stops)",
+                    "Click a track name to select it; Delete removes it",
+                    "Trash icon / right-click a track: delete, rename, duplicate",
+                    "Click: select   Shift+click: add/remove   Drag empty space: box select",
+                    "Drag clips: move the whole selection   Ctrl+scroll: zoom",
                     "Ctrl+A select all   Ctrl+D duplicate   Esc clear",
-                    "Piano roll: click cell to add a note, drag to box-select",
-                    "Piano roll: arrows nudge selected notes, Delete removes",
-                    "Right-click a note to delete it",
+                    "Piano roll: click to add notes, drag to box-select, right-click deletes",
+                    "Piano roll: arrows nudge selected notes, Q quantizes",
                 ] {
                     ui.label(line);
                 }
@@ -788,6 +886,99 @@ impl BandCraftApp {
         });
     }
 
+    /// Deletes selected notes (when the piano roll has focus), else selected clips, else selected tracks.
+    pub(crate) fn delete_selection(&mut self) {
+        if self.editor_focus {
+            if !self.note_sel.is_empty() {
+                self.delete_selected_notes();
+            }
+            return;
+        }
+        let list: Vec<ClipRef> = if self.clip_sel.is_empty() {
+            self.selected_clip.into_iter().collect()
+        } else {
+            self.clip_sel.clone()
+        };
+        if !list.is_empty() {
+            self.delete_clips(&list);
+        } else if self.track_focus {
+            let ids = self.selected_track_ids();
+            self.delete_tracks(&ids);
+        }
+    }
+
+    pub(crate) fn delete_tracks(&mut self, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.recording.as_ref().is_some_and(|r| ids.contains(&r.track_id)) {
+            if let Some(rec) = self.recording.take() {
+                let _ = rec.recorder.finish();
+            }
+            self.send(AudioCmd::Stop);
+        }
+        for &id in ids {
+            self.project.remove_track(id);
+        }
+        self.track_sel.retain(|t| !ids.contains(t));
+        if self.selected_track.is_some_and(|t| ids.contains(&t)) {
+            self.selected_track = self.track_sel.last().copied();
+        }
+        self.clip_sel.retain(|c| !ids.contains(&c.track));
+        if self.selected_clip.is_some_and(|c| ids.contains(&c.track)) {
+            self.selected_clip = None;
+        }
+        self.track_focus = false;
+        self.renaming = None;
+        self.status = if ids.len() == 1 {
+            "Track deleted. Ctrl+Z brings it back.".to_string()
+        } else {
+            format!("{} tracks deleted. Ctrl+Z brings them back.", ids.len())
+        };
+    }
+
+    fn duplicate_track(&mut self, id: u32) {
+        let Some(mut t) = self.project.track(id).cloned() else {
+            return;
+        };
+        t.id = self.project.alloc_id();
+        t.name = format!("{} copy", t.name);
+        for c in &mut t.clips {
+            c.id = self.project.alloc_id();
+        }
+        let new_id = t.id;
+        let pos = self.project.tracks.iter().position(|x| x.id == id).map_or(self.project.tracks.len(), |p| p + 1);
+        self.project.tracks.insert(pos, t);
+        self.select_only_track(new_id);
+        self.status = "Track duplicated".into();
+    }
+
+    /// Adds an empty one-bar-aligned, four-beat note clip and selects it so it opens in the piano roll.
+    fn new_clip(&mut self, track_id: u32, beat: f32) {
+        let Some(kind) = self.project.track(track_id).map(|t| t.kind) else {
+            return;
+        };
+        if kind == TrackKind::Audio {
+            self.select_only_track(track_id);
+            self.status = "Audio tracks hold recordings: press R to record, or import a WAV.".into();
+            return;
+        }
+        let start = (beat / 4.0).floor().max(0.0) * 4.0;
+        let id = self.project.alloc_id();
+        let count = self.project.track(track_id).map_or(0, |t| t.clips.len()) + 1;
+        if let Some(t) = self.project.track_mut(track_id) {
+            t.clips.push(Clip {
+                id,
+                name: format!("Pattern {count}"),
+                start,
+                length: 4.0,
+                content: ClipContent::Notes(Vec::new()),
+            });
+        }
+        self.select_clip(ClipRef { track: track_id, clip: id });
+        self.status = "Empty clip added. Click in the piano roll below to write notes.".into();
+    }
+
     pub(crate) fn select_all(&mut self) {
         if self.editor_focus {
             self.select_all_notes();
@@ -798,14 +989,22 @@ impl BandCraftApp {
                 .iter()
                 .flat_map(|t| t.clips.iter().map(move |c| ClipRef { track: t.id, clip: c.id }))
                 .collect();
+            if let Some(last) = self.clip_sel.last().copied() {
+                self.selected_clip = Some(last);
+                self.selected_track = Some(last.track);
+            }
         }
     }
 
     pub(crate) fn clear_selection(&mut self) {
+        if self.selected_loop.take().is_some() {
+            self.status = "Stopped placing loops".into();
+        }
         self.clip_sel.clear();
         self.note_sel.clear();
         self.note_sel_clip = None;
         self.editor_focus = false;
+        self.renaming = None;
     }
 
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
@@ -883,7 +1082,7 @@ impl BandCraftApp {
                 ui.add_space(8.0);
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(130.0, 16.0), Sense::hover());
                 let id = ui.scope_id().with("master");
-theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACCENT);
+                theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACCENT);
                 let (mrect, _) = ui.allocate_exact_size(Vec2::new(60.0, 14.0), Sense::hover());
                 for (k, slot) in [MASTER_L, MASTER_R].iter().enumerate() {
                     let level = self.meter_disp[*slot].clamp(0.0, 1.0);
@@ -931,9 +1130,11 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                         ui.label(RichText::new(format!("{} Hz", self.sample_rate)).small().color(theme::TEXT_DIM));
                     }
                 }
-                ui.label(RichText::new("Project").small().color(theme::TEXT_DIM));
-                ui.add(egui::TextEdit::singleline(&mut self.project_path).desired_width(180.0));
-                ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(130.0).hint_text("output.wav"));
+                ui.add(egui::TextEdit::singleline(&mut self.export_path).desired_width(120.0).hint_text("output.wav"));
+                ui.label(RichText::new("Export to").small().color(theme::TEXT_DIM));
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(&mut self.project_path).desired_width(170.0));
+                ui.label(RichText::new("Project file").small().color(theme::TEXT_DIM));
             });
         });
     }
@@ -1063,11 +1264,34 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
         });
 
         theme::caption(ui, "Loops");
-        ui.label(
-            RichText::new("Click a loop, then click a lane. Double-click to fill a new track.")
-                .small()
-                .color(theme::TEXT_DIM),
-        );
+        if let Some(i) = self.selected_loop {
+            let mut stop = false;
+            egui::Frame::new()
+                .fill(mix(theme::CARD, theme::ACCENT, 0.16))
+                .corner_radius(CornerRadius::same(9))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Placing: {}", LIBRARY[i].name)).strong().color(theme::ACCENT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Stop").clicked() {
+                                stop = true;
+                            }
+                        });
+                    });
+                    ui.label(RichText::new("Click a matching lane to drop it.").small().color(theme::TEXT_DIM));
+                });
+            if stop {
+                self.selected_loop = None;
+            }
+        } else {
+            ui.label(
+                RichText::new("Click a loop to arm it, then click a lane. Double-click a loop to fill a new track.")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for category in CATEGORIES {
                 ui.add_space(6.0);
@@ -1081,6 +1305,7 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                     }
                     if resp.double_clicked() {
                         self.add_loop_track(i);
+                        self.selected_loop = None;
                     }
                 }
             }
@@ -1092,13 +1317,17 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
         if !pointer_down {
             self.clip_drag = None;
         }
+        let zoom = ui.input(|i| i.zoom_delta());
+        if (zoom - 1.0).abs() > 1e-4 && ui.rect_contains_pointer(ui.max_rect()) {
+            self.px_per_beat = (self.px_per_beat * zoom).clamp(8.0, 80.0);
+        }
         let shift = ui.input(|i| i.modifiers.shift);
         let ppb = self.px_per_beat;
         let bpm = self.project.bpm;
         let song_beats = self.project.song_beats();
         let track_count = self.project.tracks.len();
         let content_w = HEADER_W + (song_beats + 16.0) * ppb;
-        let content_h = RULER_H + (track_count as f32 + 1.5) * LANE_H;
+        let content_h = (RULER_H + track_count as f32 * LANE_H + 80.0).max(ui.available_height());
         let playhead = self.playhead_beats();
         let selected_track = self.selected_track;
         let track_sel = self.track_sel.clone();
@@ -1106,6 +1335,8 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
         let clip_sel = self.clip_sel.clone();
         let recording = self.recording.as_ref().map(|r| (r.track_id, r.start_beat));
         let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+        let renaming = self.renaming;
+        let armed: Option<&'static LoopDef> = self.selected_loop.and_then(|i| LIBRARY.get(i));
         let project = &mut self.project;
         let clip_drag = &mut self.clip_drag;
         let marquee = &mut self.marquee;
@@ -1125,6 +1356,7 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                 let lanes_bottom = lane_top(track_count);
                 let song_end_x = beat_x(song_beats);
                 let max_beats = (timeline_w / ppb).ceil() as usize;
+                let bar_start = |beat: f32| (beat / 4.0).floor().max(0.0) * 4.0;
 
                 // Lane backgrounds
                 for (i, track) in project.tracks.iter().enumerate() {
@@ -1139,7 +1371,7 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                     p.rect_filled(r, 0.0, bg);
                     p.line_segment(
                         [Pos2::new(timeline_left, r.bottom()), Pos2::new(origin.x + content_w, r.bottom())],
-                        Stroke::new(1.0, Color32::from_black_alpha(120)),
+                        Stroke::new(1.0, Color32::from_black_alpha(110)),
                     );
                 }
                 let empty = Rect::from_min_max(
@@ -1148,9 +1380,23 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                 );
                 p.rect_filled(empty, 0.0, theme::WINDOW_BG);
 
+                // Alternate bars are shaded a touch lighter; beat lines appear when zoomed in.
+                for k in 0..=(max_beats / 8) {
+                    let x0 = beat_x((2 * k + 1) as f32 * 4.0);
+                    let x1 = beat_x((2 * k + 2) as f32 * 4.0);
+                    p.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, origin.y + RULER_H), Pos2::new(x1, lanes_bottom)),
+                        0.0,
+                        Color32::from_white_alpha(5),
+                    );
+                }
                 for b in 0..=max_beats {
+                    let bar = b % 4 == 0;
+                    if !bar && ppb < 16.0 {
+                        continue;
+                    }
                     let x = beat_x(b as f32);
-                    let col = if b % 4 == 0 { theme::GRID_BAR } else { theme::GRID_BEAT };
+                    let col = if bar { theme::GRID_BAR } else { theme::GRID_BEAT };
                     p.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, lanes_bottom)], Stroke::new(1.0, col));
                 }
                 if song_end_x < origin.x + content_w {
@@ -1162,12 +1408,29 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                         0.0,
                         Color32::from_black_alpha(120),
                     );
+                    p.line_segment(
+                        [Pos2::new(song_end_x, origin.y + RULER_H), Pos2::new(song_end_x, lanes_bottom)],
+                        Stroke::new(1.0, theme::GRID_BAR),
+                    );
                 }
 
-                // Lanes: click places/selects, drag starts a box selection (registered before clips).
+                if track_count == 0 {
+                    let c = origin + viewport.center().to_vec2() + Vec2::new(HEADER_W * 0.5, 0.0);
+                    p.text(c - Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, "Your song is empty", FontId::proportional(18.0), theme::TEXT);
+                    p.text(
+                        c + Vec2::new(0.0, 12.0),
+                        Align2::CENTER_CENTER,
+                        "Click an instrument on the left, or use + Track.",
+                        FontId::proportional(12.5),
+                        theme::TEXT_DIM,
+                    );
+                }
+
+                // Lanes: click selects/places, double-click adds an empty clip, drag box-selects.
                 for (i, track) in project.tracks.iter().enumerate() {
                     let r = Rect::from_min_size(Pos2::new(timeline_left, lane_top(i)), Vec2::new(timeline_w, LANE_H));
                     let resp = ui.interact(r, ui.scope_id().with(("lane", track.id)), Sense::click_and_drag());
+                    let beat_key = ui.scope_id().with(("ctxbeat", track.id));
                     if resp.drag_started() {
                         if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
                             *marquee = Some(Marquee { start: pos, additive: shift });
@@ -1178,11 +1441,85 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                             actions.push(Action::LaneClick { track: track.id, beat: beat_at(pos.x) });
                         }
                     }
+                    if resp.double_clicked() && armed.is_none() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            actions.push(Action::NewClip { track: track.id, beat: beat_at(pos.x) });
+                        }
+                    }
+                    if resp.secondary_clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            ui.data_mut(|d| d.insert_temp(beat_key, beat_at(pos.x)));
+                        }
+                    }
+                    if resp.hovered() && !pointer_down && marquee.is_none() {
+                        if let Some(pos) = resp.hover_pos() {
+                            let start = bar_start(beat_at(pos.x));
+                            match armed {
+                                Some(lp) if lp.kind() == track.kind => {
+                                    let g = Rect::from_min_size(
+                                        Pos2::new(beat_x(start), r.top() + 6.0),
+                                        Vec2::new((lp.beats() * ppb).max(8.0), LANE_H - 12.0),
+                                    );
+                                    p.rect_filled(g, 8.0, kind_color(lp.kind()).gamma_multiply(0.30));
+                                    p.rect_stroke(g, 8.0, Stroke::new(1.5, kind_color(lp.kind())), StrokeKind::Inside);
+                                    p.with_clip_rect(g).text(
+                                        g.left_top() + Vec2::new(8.0, 4.0),
+                                        Align2::LEFT_TOP,
+                                        lp.name,
+                                        FontId::proportional(11.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                Some(_) => ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed),
+                                None if track.kind != TrackKind::Audio => {
+                                    let g = Rect::from_min_size(
+                                        Pos2::new(beat_x(start), r.top() + 6.0),
+                                        Vec2::new(4.0 * ppb, LANE_H - 12.0),
+                                    );
+                                    p.rect_stroke(g, 8.0, Stroke::new(1.0, Color32::from_white_alpha(34)), StrokeKind::Inside);
+                                    if g.width() > 150.0 {
+                                        p.text(
+                                            g.center(),
+                                            Align2::CENTER_CENTER,
+                                            "+ Double-click to add a clip",
+                                            FontId::proportional(11.5),
+                                            Color32::from_white_alpha(64),
+                                        );
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    let tid = track.id;
+                    let tkind = track.kind;
+                    let n_sel = if track_sel.contains(&tid) { track_sel.len() } else { 1 };
+                    resp.context_menu(|ui| {
+                        ui.set_min_width(190.0);
+                        let beat: f32 = ui.data(|d| d.get_temp(beat_key)).unwrap_or(0.0);
+                        if tkind != TrackKind::Audio && ui.button("New empty clip here").clicked() {
+                            actions.push(Action::NewClip { track: tid, beat });
+                            ui.close();
+                        }
+                        if let Some(lp) = armed {
+                            if lp.kind() == tkind && ui.button(format!("Place '{}' here", lp.name)).clicked() {
+                                actions.push(Action::LaneClick { track: tid, beat });
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        track_menu(ui, tid, n_sel, &mut actions);
+                    });
                 }
 
                 // Clips
                 let mut clip_rects: Vec<(ClipRef, Rect)> = Vec::new();
                 for (i, track) in project.tracks.iter().enumerate() {
+                    let base = if track.mute {
+                        mix(track_color(track.color), Color32::from_gray(78), 0.72)
+                    } else {
+                        track_color(track.color)
+                    };
                     for clip in &track.clips {
                         let len = clip.length_beats(bpm);
                         let r = Rect::from_min_size(
@@ -1191,12 +1528,18 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                         );
                         let cref = ClipRef { track: track.id, clip: clip.id };
                         let selected = clip_sel.contains(&cref);
-                        draw_clip(&p, r, clip, track.kind, track_color(track.color), ppb, bpm, selected);
+                        draw_clip(&p, r, clip, track.kind, base, ppb, bpm, selected);
                         clip_rects.push((cref, r));
 
                         let resp = ui.interact(r, ui.scope_id().with(("clip", clip.id)), Sense::click_and_drag());
+                        if resp.hovered() && !pointer_down {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
                         if resp.clicked() {
                             actions.push(Action::ClickClip { clip: cref, shift });
+                        }
+                        if resp.secondary_clicked() && !clip_sel.contains(&cref) {
+                            actions.push(Action::ClickClip { clip: cref, shift: false });
                         }
                         if resp.drag_started() {
                             let mut origins = Vec::new();
@@ -1222,6 +1565,7 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                             }
                         }
                         if resp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                             if let (Some(d), Some(pos)) = (clip_drag.as_ref(), resp.interact_pointer_pos()) {
                                 if d.clip == cref {
                                     let primary_origin = d.origins.iter().find(|(c, _)| *c == cref).map_or(clip.start, |o| o.1);
@@ -1236,19 +1580,24 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                                 }
                             }
                         }
+                        let is_notes = matches!(clip.content, ClipContent::Notes(_));
                         resp.context_menu(|ui| {
-                            let n = clip_sel.len().max(1);
-                            let label = if n > 1 && clip_sel.contains(&cref) {
-                                format!("Delete {n} clips")
-                            } else {
-                                "Delete clip".to_string()
-                            };
-                            if ui.button(label).clicked() {
-                                if clip_sel.contains(&cref) {
-                                    actions.push(Action::DeleteClips(clip_sel.clone()));
-                                } else {
-                                    actions.push(Action::DeleteClips(vec![cref]));
-                                }
+                            ui.set_min_width(190.0);
+                            let targets: Vec<ClipRef> = if clip_sel.contains(&cref) { clip_sel.clone() } else { vec![cref] };
+                            let n = targets.len();
+                            if is_notes && ui.button("Edit notes").clicked() {
+                                actions.push(Action::ClickClip { clip: cref, shift: false });
+                                ui.close();
+                            }
+                            let dup = if n > 1 { format!("Duplicate {n} clips") } else { "Duplicate".to_string() };
+                            if ui.button(dup).clicked() {
+                                actions.push(Action::DuplicateClips(targets.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
+                            let del = if n > 1 { format!("Delete {n} clips") } else { "Delete clip".to_string() };
+                            if ui.add(egui::Button::new(RichText::new(del).color(theme::RECORD))).clicked() {
+                                actions.push(Action::DeleteClips(targets));
                                 ui.close();
                             }
                         });
@@ -1257,18 +1606,17 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
 
                 // Box selection overlay: finish on release.
                 if let Some(m) = marquee.as_ref() {
-                    if let Some(now) = pointer_pos {
-                        let sel = Rect::from_two_pos(m.start, now);
-                        p.rect_filled(sel, 2.0, Color32::from_rgba_unmultiplied(46, 200, 186, 40));
-                        p.rect_stroke(sel, 2.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
-                        if !pointer_down {
-                            let hits = clip_rects
-                                .iter()
-                                .filter(|(_, r)| r.intersects(sel))
-                                .map(|(c, _)| *c)
-                                .collect();
-                            actions.push(Action::MarqueeFinish { hits, additive: m.additive });
-                        }
+                    let now = pointer_pos.unwrap_or(m.start);
+                    let sel = Rect::from_two_pos(m.start, now);
+                    p.rect_filled(sel, 3.0, Color32::from_rgba_unmultiplied(52, 211, 196, 36));
+                    p.rect_stroke(sel, 3.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
+                    if !pointer_down {
+                        let hits = clip_rects
+                            .iter()
+                            .filter(|(_, r)| r.intersects(sel))
+                            .map(|(c, _)| *c)
+                            .collect();
+                        actions.push(Action::MarqueeFinish { hits, additive: m.additive });
                     }
                     if !pointer_down {
                         *marquee = None;
@@ -1281,13 +1629,13 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                         let x0 = beat_x(start);
                         let x1 = beat_x(playhead.max(start)).max(x0 + 4.0);
                         let r = Rect::from_min_max(Pos2::new(x0, lane_top(i) + 6.0), Pos2::new(x1, lane_top(i) + LANE_H - 6.0));
-                        p.rect_filled(r, 6.0, Color32::from_rgb(120, 34, 42));
-                        p.rect_stroke(r, 6.0, Stroke::new(1.5, theme::RECORD), StrokeKind::Inside);
+                        p.rect_filled(r, 8.0, Color32::from_rgb(110, 30, 40));
+                        p.rect_stroke(r, 8.0, Stroke::new(1.5, theme::RECORD), StrokeKind::Inside);
                         p.text(
-                            r.left_top() + Vec2::new(8.0, 6.0),
+                            r.left_top() + Vec2::new(10.0, 6.0),
                             Align2::LEFT_TOP,
                             "● REC",
-                            FontId::proportional(11.0),
+                            FontId::proportional(11.5),
                             theme::RECORD,
                         );
                     }
@@ -1298,46 +1646,44 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                 if px >= timeline_left {
                     p.line_segment(
                         [Pos2::new(px, origin.y + RULER_H), Pos2::new(px, lanes_bottom)],
+                        Stroke::new(5.0, Color32::from_white_alpha(18)),
+                    );
+                    p.line_segment(
+                        [Pos2::new(px, origin.y + RULER_H), Pos2::new(px, lanes_bottom)],
                         Stroke::new(1.5, theme::PLAYHEAD),
                     );
-                }
-
-                // Add-track row below the last lane
-                let add_rect = Rect::from_min_size(
-                    Pos2::new(timeline_left + 12.0, lanes_bottom + 14.0),
-                    Vec2::new(150.0, 28.0),
-                );
-                if ui
-                    .put(add_rect, egui::Button::new(RichText::new("+ Add synth track").color(theme::TEXT_DIM)))
-                    .clicked()
-                {
-                    actions.push(Action::AddTrack(TrackKind::Synth));
                 }
 
                 // Ruler (sticky to the top of the viewport)
                 let ruler_y = origin.y + viewport.min.y;
                 let ruler = Rect::from_min_size(Pos2::new(timeline_left, ruler_y), Vec2::new(timeline_w, RULER_H));
                 p.rect_filled(ruler, 0.0, theme::PANEL_BG);
+                p.line_segment(
+                    [Pos2::new(timeline_left, ruler_y + RULER_H), Pos2::new(origin.x + content_w, ruler_y + RULER_H)],
+                    Stroke::new(1.0, Color32::from_black_alpha(160)),
+                );
                 for bar in 0..=(max_beats / 4) {
                     let x = beat_x(bar as f32 * 4.0);
                     p.line_segment(
-                        [Pos2::new(x, ruler_y), Pos2::new(x, ruler_y + RULER_H)],
-                        Stroke::new(1.0, Color32::from_gray(90)),
+                        [Pos2::new(x, ruler_y + 4.0), Pos2::new(x, ruler_y + RULER_H)],
+                        Stroke::new(1.0, Color32::from_gray(96)),
                     );
                     p.text(
-                        Pos2::new(x + 5.0, ruler_y + 6.0),
+                        Pos2::new(x + 6.0, ruler_y + 6.0),
                         Align2::LEFT_TOP,
                         format!("{}", bar + 1),
                         FontId::proportional(11.5),
                         theme::TEXT_DIM,
                     );
                 }
-                for b in 0..=max_beats {
-                    let x = beat_x(b as f32);
-                    p.line_segment(
-                        [Pos2::new(x, ruler_y + RULER_H - 6.0), Pos2::new(x, ruler_y + RULER_H)],
-                        Stroke::new(1.0, Color32::from_gray(70)),
-                    );
+                if ppb >= 16.0 {
+                    for b in (0..=max_beats).filter(|b| b % 4 != 0) {
+                        let x = beat_x(b as f32);
+                        p.line_segment(
+                            [Pos2::new(x, ruler_y + RULER_H - 5.0), Pos2::new(x, ruler_y + RULER_H)],
+                            Stroke::new(1.0, Color32::from_gray(62)),
+                        );
+                    }
                 }
                 let ruler_resp = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
                 if ruler_resp.clicked() || ruler_resp.dragged() {
@@ -1348,9 +1694,9 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                 if px >= timeline_left {
                     p.add(egui::Shape::convex_polygon(
                         vec![
-                            Pos2::new(px - 6.0, ruler_y),
-                            Pos2::new(px + 6.0, ruler_y),
-                            Pos2::new(px, ruler_y + 9.0),
+                            Pos2::new(px - 6.0, ruler_y + 1.0),
+                            Pos2::new(px + 6.0, ruler_y + 1.0),
+                            Pos2::new(px, ruler_y + 10.0),
                         ],
                         theme::PLAYHEAD,
                         Stroke::NONE,
@@ -1360,88 +1706,132 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                 // Track headers (sticky to the left edge of the viewport)
                 let sx = origin.x + viewport.min.x;
                 p.rect_filled(
-                    Rect::from_min_size(Pos2::new(sx, ruler_y), Vec2::new(HEADER_W, RULER_H)),
+                    Rect::from_min_max(Pos2::new(sx, lanes_bottom), Pos2::new(sx + HEADER_W, origin.y + content_h)),
                     0.0,
                     theme::PANEL_BG,
-                );
-                p.text(
-                    Pos2::new(sx + 14.0, ruler_y + 7.0),
-                    Align2::LEFT_TOP,
-                    "TRACKS",
-                    FontId::proportional(10.0),
-                    theme::TEXT_DIM,
                 );
                 for (i, track) in project.tracks.iter_mut().enumerate() {
                     let top = lane_top(i);
                     let id = track.id;
+                    let color = track_color(track.color);
                     let hr = Rect::from_min_size(Pos2::new(sx, top), Vec2::new(HEADER_W, LANE_H));
                     let sel = track_sel.contains(&id) || selected_track == Some(id);
-                    p.rect_filled(hr, 0.0, if sel { Color32::from_rgb(46, 46, 56) } else { Color32::from_rgb(36, 36, 43) });
-                    p.rect_filled(Rect::from_min_size(Pos2::new(sx, top), Vec2::new(5.0, LANE_H)), 0.0, track_color(track.color));
+                    p.rect_filled(hr, 0.0, mix(theme::CARD, color, if sel { 0.16 } else { 0.05 }));
+                    p.rect_filled(
+                        Rect::from_min_size(Pos2::new(sx + 4.0, top + 8.0), Vec2::new(4.0, LANE_H - 16.0)),
+                        2.0,
+                        color,
+                    );
                     p.line_segment(
                         [Pos2::new(hr.right(), top), Pos2::new(hr.right(), top + LANE_H)],
-                        Stroke::new(1.0, Color32::from_black_alpha(140)),
+                        Stroke::new(1.0, Color32::from_black_alpha(160)),
                     );
-                    p.text(Pos2::new(sx + 16.0, top + 10.0), Align2::LEFT_TOP, &track.name, FontId::proportional(13.0), theme::TEXT);
+                    p.line_segment(
+                        [Pos2::new(sx, top + LANE_H), Pos2::new(hr.right(), top + LANE_H)],
+                        Stroke::new(1.0, Color32::from_black_alpha(110)),
+                    );
+
+                    // Whole header: click selects, double-click renames, right-click opens the menu.
+                    let head = ui.interact(hr, ui.scope_id().with(("thead", id)), Sense::click());
+                    if head.clicked() {
+                        actions.push(Action::SelectTrack { id, shift });
+                    }
+                    if head.double_clicked() {
+                        actions.push(Action::Rename(Some(id)));
+                    }
+                    let n_sel = if track_sel.contains(&id) { track_sel.len() } else { 1 };
+                    head.context_menu(|ui| track_menu(ui, id, n_sel, &mut actions));
+
+                    let name_rect = Rect::from_min_size(Pos2::new(sx + 16.0, top + 8.0), Vec2::new(HEADER_W - 16.0 - 66.0, 22.0));
+                    if renaming == Some(id) {
+                        let te = ui.put(
+                            name_rect,
+                            egui::TextEdit::singleline(&mut track.name).font(FontId::proportional(13.0)),
+                        );
+                        let key = ui.scope_id().with(("renamefocus", id));
+                        let started: bool = ui.data(|d| d.get_temp(key).unwrap_or(false));
+                        if !started {
+                            te.request_focus();
+                            ui.data_mut(|d| d.insert_temp(key, true));
+                        }
+                        if te.lost_focus() {
+                            if track.name.trim().is_empty() {
+                                track.name = kind_label(track.kind).to_string();
+                            }
+                            actions.push(Action::Rename(None));
+                            ui.data_mut(|d| d.remove::<bool>(key));
+                        }
+                    } else {
+                        p.with_clip_rect(name_rect).text(
+                            Pos2::new(name_rect.left(), top + 10.0),
+                            Align2::LEFT_TOP,
+                            &track.name,
+                            FontId::proportional(13.5),
+                            theme::TEXT,
+                        );
+                    }
                     p.text(
-                        Pos2::new(sx + 16.0, top + 28.0),
+                        Pos2::new(sx + 16.0, top + 31.0),
                         Align2::LEFT_TOP,
                         kind_label(track.kind),
                         FontId::proportional(10.5),
                         theme::TEXT_DIM,
                     );
 
-                    let name_rect = Rect::from_min_size(Pos2::new(sx, top), Vec2::new(HEADER_W - 36.0, 46.0));
-                    if ui.interact(name_rect, ui.scope_id().with(("tname", id)), Sense::click()).clicked() {
-                        actions.push(Action::SelectTrack { id, shift });
+                    // Delete (trash) and options (dots): both work with a plain left click.
+                    let trash = Rect::from_min_size(Pos2::new(sx + HEADER_W - 34.0, top + 8.0), Vec2::splat(24.0));
+                    let tr = ui.interact(trash, ui.scope_id().with(("tdel", id)), Sense::click());
+                    if tr.hovered() {
+                        p.rect_filled(trash, 6.0, Color32::from_rgba_unmultiplied(236, 72, 82, 46));
                     }
+                    theme::paint_icon(&p, trash.shrink(5.0), Icon::Trash, if tr.hovered() { theme::RECORD } else { theme::TEXT_DIM });
+                    if tr.clicked() {
+                        actions.push(Action::DeleteTrack(id));
+                    }
+                    tr.on_hover_text(if n_sel > 1 { "Delete selected tracks" } else { "Delete track" });
 
-                    let dots = Rect::from_min_size(Pos2::new(sx + HEADER_W - 28.0, top + 10.0), Vec2::splat(18.0));
+                    let dots = Rect::from_min_size(Pos2::new(sx + HEADER_W - 60.0, top + 8.0), Vec2::splat(24.0));
                     let dr = ui.interact(dots, ui.scope_id().with(("tdots", id)), Sense::click());
-                    theme::paint_icon(&p, dots, Icon::Dots, if dr.hovered() { theme::TEXT } else { theme::TEXT_DIM });
-                    dr.on_hover_text("Right-click for track options").context_menu(|ui| {
-                        let n = track_sel.len().max(1);
-                        let label = if n > 1 { format!("Delete {n} tracks") } else { "Delete track".to_string() };
-                        if ui.button(label).clicked() {
-                            actions.push(Action::DeleteTracks);
-                            ui.close();
-                        }
-                    });
+                    if dr.hovered() {
+                        p.rect_filled(dots, 6.0, theme::SURFACE_HI);
+                    }
+                    theme::paint_icon(&p, dots.shrink(5.0), Icon::Dots, if dr.hovered() { theme::TEXT } else { theme::TEXT_DIM });
+                    egui::Popup::menu(&dr).show(|ui| track_menu(ui, id, n_sel, &mut actions));
 
-                    let mute_r = Rect::from_min_size(Pos2::new(sx + 16.0, top + 52.0), Vec2::new(26.0, 19.0));
-                    let solo_r = Rect::from_min_size(Pos2::new(sx + 48.0, top + 52.0), Vec2::new(26.0, 19.0));
-                    for (r, label, on, on_color) in [
-                        (mute_r, "M", track.mute, theme::MUTE_ON),
-                        (solo_r, "S", track.solo, theme::SOLO_ON),
+                    let mute_r = Rect::from_min_size(Pos2::new(sx + 16.0, top + 54.0), Vec2::new(28.0, 20.0));
+                    let solo_r = Rect::from_min_size(Pos2::new(sx + 50.0, top + 54.0), Vec2::new(28.0, 20.0));
+                    for (r, label, on, on_color, key) in [
+                        (mute_r, "M", track.mute, theme::MUTE_ON, "mute"),
+                        (solo_r, "S", track.solo, theme::SOLO_ON, "solo"),
                     ] {
-                        p.rect_filled(r, 4.0, if on { on_color } else { Color32::from_rgb(52, 52, 62) });
+                        let resp = ui.interact(r, ui.scope_id().with((key, id)), Sense::click());
+                        let off = if resp.hovered() { Color32::from_rgb(70, 70, 86) } else { Color32::from_rgb(52, 52, 66) };
+                        p.rect_filled(r, 5.0, if on { on_color } else { off });
                         p.text(
                             r.center(),
                             Align2::CENTER_CENTER,
                             label,
-                            FontId::proportional(11.0),
+                            FontId::proportional(11.5),
                             if on { Color32::from_rgb(18, 18, 22) } else { theme::TEXT_DIM },
                         );
-                    }
-                    if ui.interact(mute_r, ui.scope_id().with(("mute", id)), Sense::click()).clicked() {
-                        actions.push(Action::ToggleMute(id));
-                    }
-                    if ui.interact(solo_r, ui.scope_id().with(("solo", id)), Sense::click()).clicked() {
-                        actions.push(Action::ToggleSolo(id));
+                        if resp.clicked() {
+                            actions.push(if key == "mute" { Action::ToggleMute(id) } else { Action::ToggleSolo(id) });
+                        }
+                        resp.on_hover_text(if key == "mute" { "Mute" } else { "Solo" });
                     }
 
-                    let knob_r = Rect::from_min_size(Pos2::new(sx + 84.0, top + 49.0), Vec2::splat(24.0));
+                    let knob_r = Rect::from_min_size(Pos2::new(sx + 90.0, top + 51.0), Vec2::splat(26.0));
                     ui.put(knob_r, |ui: &mut egui::Ui| {
-                        theme::knob(ui, &mut track.pan, -1.0, 1.0, 0.0, 24.0, "Pan (drag, double-click to centre)")
+                        theme::knob(ui, &mut track.pan, -1.0, 1.0, 0.0, 26.0, "Pan (drag, double-click to centre)")
                     });
                     let fader_r = Rect::from_min_max(
-                        Pos2::new(sx + 120.0, top + 55.0),
-                        Pos2::new(sx + HEADER_W - 14.0, top + 67.0),
+                        Pos2::new(sx + 128.0, top + 58.0),
+                        Pos2::new(sx + HEADER_W - 16.0, top + 70.0),
                     );
                     let vol_id = ui.scope_id().with(("vol", id));
-                    theme::fader(ui, vol_id, fader_r, &mut track.volume, 0.0, 1.5, track_color(track.color));
+                    theme::fader(ui, vol_id, fader_r, &mut track.volume, 0.0, 1.5, color);
                     let level = levels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let meter_bg = Rect::from_min_max(Pos2::new(fader_r.left(), top + 69.0), Pos2::new(fader_r.right(), top + 72.0));
+                    let meter_bg = Rect::from_min_max(Pos2::new(fader_r.left(), top + 73.0), Pos2::new(fader_r.right(), top + 76.0));
                     p.rect_filled(meter_bg, 1.5, theme::WELL);
                     if level > 0.002 {
                         let mut fill = meter_bg;
@@ -1449,6 +1839,49 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
                         p.rect_filled(fill, 1.5, mix(Color32::from_rgb(70, 200, 110), Color32::from_rgb(236, 72, 82), level));
                     }
                 }
+
+                // "Add track" row under the last header
+                let add_r = Rect::from_min_size(Pos2::new(sx + 14.0, lanes_bottom + 14.0), Vec2::new(HEADER_W - 28.0, 36.0));
+                let ar = ui.interact(add_r, ui.scope_id().with("addrow"), Sense::click());
+                p.rect_filled(add_r, 10.0, if ar.hovered() { theme::SURFACE_HI } else { theme::SURFACE });
+                p.rect_stroke(add_r, 10.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+                theme::paint_icon(
+                    &p,
+                    Rect::from_center_size(add_r.left_center() + Vec2::new(22.0, 0.0), Vec2::splat(16.0)),
+                    Icon::Plus,
+                    theme::ACCENT,
+                );
+                p.text(
+                    add_r.left_center() + Vec2::new(40.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    "Add track",
+                    FontId::proportional(13.0),
+                    theme::TEXT,
+                );
+                egui::Popup::menu(&ar).show(|ui| add_track_menu(ui, &mut actions));
+
+                // Header corner (always visible): title and a quick "+ Track" button
+                p.rect_filled(
+                    Rect::from_min_size(Pos2::new(sx, ruler_y), Vec2::new(HEADER_W, RULER_H)),
+                    0.0,
+                    theme::PANEL_BG,
+                );
+                p.line_segment(
+                    [Pos2::new(sx, ruler_y + RULER_H), Pos2::new(sx + HEADER_W, ruler_y + RULER_H)],
+                    Stroke::new(1.0, Color32::from_black_alpha(160)),
+                );
+                p.text(
+                    Pos2::new(sx + 16.0, ruler_y + 8.0),
+                    Align2::LEFT_TOP,
+                    "TRACKS",
+                    FontId::proportional(10.0),
+                    theme::TEXT_DIM,
+                );
+                let plus = Rect::from_min_size(Pos2::new(sx + HEADER_W - 82.0, ruler_y + 3.0), Vec2::new(70.0, RULER_H - 6.0));
+                let pr = ui.interact(plus, ui.scope_id().with("addtrack"), Sense::click());
+                p.rect_filled(plus, 9.0, if pr.hovered() { mix(theme::ACCENT, Color32::WHITE, 0.2) } else { theme::ACCENT });
+                p.text(plus.center(), Align2::CENTER_CENTER, "+ Track", FontId::proportional(11.5), theme::WINDOW_BG);
+                egui::Popup::menu(&pr).show(|ui| add_track_menu(ui, &mut actions));
 
                 actions
             })
@@ -1467,8 +1900,57 @@ theme::fader(ui, id, rect, &mut self.project.master_volume, 0.0, 1.5, theme::ACC
     }
 }
 
+/// Context/popup menu for a track header.
+fn track_menu(ui: &mut egui::Ui, id: u32, selected: usize, actions: &mut Vec<Action>) {
+    ui.set_min_width(180.0);
+    if ui.button("Rename").clicked() {
+        actions.push(Action::Rename(Some(id)));
+        ui.close();
+    }
+    if ui.button("Duplicate track").clicked() {
+        actions.push(Action::DuplicateTrack(id));
+        ui.close();
+    }
+    ui.separator();
+    let label = if selected > 1 { format!("Delete {selected} tracks") } else { "Delete track".to_string() };
+    if ui.add(egui::Button::new(RichText::new(label).color(theme::RECORD))).clicked() {
+        actions.push(Action::DeleteTrack(id));
+        ui.close();
+    }
+}
+
+/// Menu used by every "+ Track" control.
+fn add_track_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    ui.set_min_width(180.0);
+    if ui.button("Synth track").clicked() {
+        actions.push(Action::AddTrack(TrackKind::Synth));
+        ui.close();
+    }
+    if ui.button("Drum kit track").clicked() {
+        actions.push(Action::AddTrack(TrackKind::Drums));
+        ui.close();
+    }
+    if ui.button("Record audio (R)").clicked() {
+        actions.push(Action::Record);
+        ui.close();
+    }
+}
+
 impl eframe::App for BandCraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The song always covers every clip, so nothing placed late is silently skipped.
+        let bpm = self.project.bpm;
+        let end = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.start + c.length_beats(bpm))
+            .fold(0.0f32, f32::max);
+        let needed = (end / 4.0).ceil() as u32;
+        if needed > self.project.bars {
+            self.project.bars = needed;
+        }
         let pointer_down = ctx.input(|i| i.pointer.any_down());
         if !pointer_down && self.project != self.snapshot {
             let previous = std::mem::replace(&mut self.snapshot, self.project.clone());
@@ -1550,16 +2032,7 @@ impl eframe::App for BandCraftApp {
                 self.clear_selection();
             }
             if keys.delete {
-                if self.editor_focus && !self.note_sel.is_empty() {
-                    self.delete_selected_notes();
-                } else {
-                    let list = if self.clip_sel.is_empty() {
-                        self.selected_clip.into_iter().collect()
-                    } else {
-                        self.clip_sel.clone()
-                    };
-                    self.delete_clips(&list);
-                }
+                self.delete_selection();
             }
             let (dx, dy) = (
                 i32::from(keys.right) - i32::from(keys.left),
@@ -1597,13 +2070,15 @@ impl eframe::App for BandCraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("menu").show(ui, |ui| self.menu_ui(ui));
-        egui::Panel::top("transport").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.transport_ui(ui);
-            ui.add_space(4.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_ui(ui));
+        egui::Panel::top("menu")
+            .frame(egui::Frame::new().fill(theme::WINDOW_BG).inner_margin(Margin::symmetric(8, 3)))
+            .show(ui, |ui| self.menu_ui(ui));
+        egui::Panel::top("transport")
+            .frame(egui::Frame::new().fill(theme::PANEL_BG).inner_margin(Margin::symmetric(12, 8)))
+            .show(ui, |ui| self.transport_ui(ui));
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::new().fill(theme::WINDOW_BG).inner_margin(Margin::symmetric(12, 4)))
+            .show(ui, |ui| self.status_ui(ui));
         egui::Panel::bottom("editor")
             .resizable(true)
             .default_size(380.0)
@@ -1623,7 +2098,9 @@ impl eframe::App for BandCraftApp {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.inspector_ui(ui));
             });
-        egui::CentralPanel::default().show(ui, |ui| self.arrangement_ui(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::WINDOW_BG))
+            .show(ui, |ui| self.arrangement_ui(ui));
     }
 }
 
@@ -1699,35 +2176,47 @@ fn chip(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn draw_clip(p: &Painter, r: Rect, clip: &Clip, kind: TrackKind, base: Color32, ppb: f32, bpm: f32, selected: bool) {
-    let body = mix(Color32::from_rgb(20, 20, 26), base, 0.42);
-    p.rect_filled(r.translate(Vec2::new(0.0, 1.5)), 6.0, Color32::from_black_alpha(70));
-    p.rect_filled(r, 6.0, body);
-    let head = Rect::from_min_size(r.min, Vec2::new(r.width(), 18.0));
-    p.rect_filled(head, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, base);
-    p.line_segment(
-        [head.left_bottom(), head.right_bottom()],
-        Stroke::new(1.0, Color32::from_black_alpha(60)),
-    );
+    p.rect_filled(r.translate(Vec2::new(0.0, 2.0)), 8.0, Color32::from_black_alpha(85));
+    p.rect_filled(r, 8.0, mix(Color32::from_rgb(22, 22, 29), base, 0.34));
+    let head = Rect::from_min_size(r.min, Vec2::new(r.width(), 20.0f32.min(r.height())));
+    p.rect_filled(head, CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, base);
+    if r.width() > 20.0 {
+        p.line_segment(
+            [head.left_top() + Vec2::new(8.0, 1.0), head.right_top() + Vec2::new(-8.0, 1.0)],
+            Stroke::new(1.0, Color32::from_white_alpha(46)),
+        );
+    }
     let cp = p.with_clip_rect(r);
     cp.text(
-        r.left_top() + Vec2::new(8.0, 3.0),
+        r.left_top() + Vec2::new(9.0, 4.0),
         Align2::LEFT_TOP,
         &clip.name,
-        FontId::proportional(11.0),
+        FontId::proportional(11.5),
         Color32::WHITE,
     );
-    let area = Rect::from_min_max(r.min + Vec2::new(0.0, 20.0), r.max - Vec2::new(0.0, 4.0));
+    let area = Rect::from_min_max(r.min + Vec2::new(0.0, 22.0), r.max - Vec2::new(0.0, 5.0));
     match &clip.content {
-        ClipContent::Notes(notes) => draw_notes(&cp, area, notes, kind, ppb),
+        ClipContent::Notes(notes) => {
+            draw_notes(&cp, area, notes, kind, ppb);
+            if notes.is_empty() && r.width() > 110.0 {
+                cp.text(
+                    area.center(),
+                    Align2::CENTER_CENTER,
+                    "Empty: click to edit",
+                    FontId::proportional(11.0),
+                    Color32::from_white_alpha(90),
+                );
+            }
+        }
         ClipContent::Audio { data: Some(d), .. } => draw_wave(&cp, area, d, bpm, ppb),
         ClipContent::Audio { data: None, .. } => {}
     }
-    let stroke = if selected {
-        Stroke::new(2.0, Color32::WHITE)
+    if selected {
+        p.rect_stroke(r.expand(2.5), 10.0, Stroke::new(2.0, Color32::from_rgba_unmultiplied(52, 211, 196, 120)), StrokeKind::Outside);
+        p.rect_stroke(r, 8.0, Stroke::new(1.8, Color32::WHITE), StrokeKind::Inside);
     } else {
-        Stroke::new(1.0, Color32::from_black_alpha(110))
-    };
-    p.rect_stroke(r, 6.0, stroke, StrokeKind::Inside);
+        p.rect_stroke(r, 8.0, Stroke::new(1.0, Color32::from_black_alpha(120)), StrokeKind::Inside);
+    }
 }
 
 fn draw_notes(p: &Painter, r: Rect, notes: &[Note], kind: TrackKind, ppb: f32) {
@@ -1788,26 +2277,28 @@ pub(crate) fn sound_card(ui: &mut egui::Ui, name: &str, sub: &str, color: Color3
 }
 
 pub(crate) fn sound_card_sel(ui: &mut egui::Ui, name: &str, sub: &str, color: Color32, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
     let p = ui.painter();
     let bg = if selected {
-        theme::SURFACE_HI
+        mix(theme::SURFACE_HI, color, 0.18)
     } else if resp.hovered() {
         theme::SURFACE
     } else {
         theme::CARD
     };
-    p.rect_filled(rect, 8.0, bg);
+    p.rect_filled(rect, 10.0, bg);
     p.rect_filled(
-        Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 8.0), Vec2::new(4.0, rect.height() - 16.0)),
+        Rect::from_min_size(rect.left_top() + Vec2::new(8.0, 10.0), Vec2::new(4.0, rect.height() - 20.0)),
         2.0,
         color,
     );
-    p.text(rect.left_top() + Vec2::new(14.0, 9.0), Align2::LEFT_TOP, name, FontId::proportional(13.0), theme::TEXT);
-    p.text(rect.left_top() + Vec2::new(14.0, 26.0), Align2::LEFT_TOP, sub, FontId::proportional(10.5), theme::TEXT_DIM);
+    p.text(rect.left_top() + Vec2::new(22.0, 9.0), Align2::LEFT_TOP, name, FontId::proportional(13.0), theme::TEXT);
+    p.text(rect.left_top() + Vec2::new(22.0, 27.0), Align2::LEFT_TOP, sub, FontId::proportional(10.5), theme::TEXT_DIM);
     if selected {
-        p.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
+        p.rect_stroke(rect, 10.0, Stroke::new(1.2, color), StrokeKind::Inside);
+    } else if resp.hovered() {
+        p.rect_stroke(rect, 10.0, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
     }
-    ui.add_space(3.0);
+    ui.add_space(2.0);
     resp
 }

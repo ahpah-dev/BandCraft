@@ -287,8 +287,9 @@ impl BandCraftApp {
                 .and_then(|t| t.clips.iter_mut().find(|c| c.id == cref.clip))
             {
                 let mut bars = clip.length / 4.0;
+                let unit = if (bars - 1.0).abs() < 0.01 { " bar" } else { " bars" };
                 if ui
-                    .add(egui::DragValue::new(&mut bars).range(1.0..=16.0).speed(0.1).fixed_decimals(0).suffix(" bars"))
+                    .add(egui::DragValue::new(&mut bars).range(1.0..=16.0).speed(0.1).fixed_decimals(0).suffix(unit))
                     .changed()
                 {
                     clip.length = bars.round().max(1.0) * 4.0;

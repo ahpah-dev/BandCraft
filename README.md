@@ -14,7 +14,7 @@ Needs a recent stable Rust toolchain. Audio uses `cpal` (WASAPI on Windows; on L
 
 ## Features
 
-- **Arrangement:** multi-track timeline, clip dragging, per-track colors, mute/solo/pan/volume, level meters, loop and metronome.
+- **Arrangement:** multi-track timeline, clip dragging, per-track colors, mute/solo/pan/volume, level meters, loop and metronome. Double-click a lane to add an empty clip; click a loop, then a lane, to place it (with a ghost preview). Delete tracks with the trash icon, right-click menu or Delete key; rename by double-clicking. Ctrl+scroll zooms; the song grows to fit its clips.
 - **Selection:** click, shift-click, box-select and drag clips and tracks; Ctrl+A, Ctrl+D, Esc.
 - **Piano roll:** variable note lengths, snap (1/4 to 1/32), piano keys, velocity lane, box select, move/resize, quantize, octave shift, copy/paste, scale highlighting, note audition.
 - **Instruments (39 premade, all synthesized, no samples needed):** keys, bass, leads, pads, plucked strings, organs, bells and mallets, wavetables; 8 drum kits.
@@ -30,7 +30,8 @@ Needs a recent stable Rust toolchain. Audio uses `cpal` (WASAPI on Windows; on L
 | R | Record |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+A / Ctrl+D / Esc | Select all / duplicate / clear selection |
-| Delete | Remove selection |
+| Delete | Remove selected notes, clips or (after clicking a track name) tracks |
+| Double-click lane / header | New empty clip / rename track |
 | Q, arrows, Ctrl+C / Ctrl+V | Piano roll: quantize, nudge, copy, paste |
 
 ## Layout

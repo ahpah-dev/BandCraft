@@ -9,20 +9,21 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-pub const CARD: Color32 = rgb(36, 36, 43);
-pub const WINDOW_BG: Color32 = rgb(20, 20, 24);
-pub const PANEL_BG: Color32 = rgb(30, 30, 36);
-pub const SURFACE: Color32 = rgb(40, 40, 47);
-pub const SURFACE_HI: Color32 = rgb(54, 54, 63);
-pub const WELL: Color32 = rgb(15, 15, 19);
-pub const LANE_EVEN: Color32 = rgb(29, 29, 35);
-pub const LANE_ODD: Color32 = rgb(25, 25, 31);
-pub const LANE_SELECTED: Color32 = rgb(36, 36, 44);
-pub const GRID_BEAT: Color32 = rgb(40, 40, 48);
-pub const GRID_BAR: Color32 = rgb(64, 64, 74);
+pub const CARD: Color32 = rgb(35, 35, 44);
+pub const WINDOW_BG: Color32 = rgb(16, 16, 21);
+pub const PANEL_BG: Color32 = rgb(26, 26, 33);
+pub const SURFACE: Color32 = rgb(43, 43, 54);
+pub const SURFACE_HI: Color32 = rgb(60, 60, 76);
+pub const WELL: Color32 = rgb(12, 12, 16);
+pub const LANE_EVEN: Color32 = rgb(27, 27, 34);
+pub const LANE_ODD: Color32 = rgb(23, 23, 29);
+pub const LANE_SELECTED: Color32 = rgb(33, 36, 46);
+pub const GRID_BEAT: Color32 = rgb(36, 36, 45);
+pub const GRID_BAR: Color32 = rgb(58, 58, 72);
 pub const TEXT: Color32 = rgb(232, 232, 238);
 pub const TEXT_DIM: Color32 = rgb(138, 138, 150);
-pub const ACCENT: Color32 = rgb(46, 200, 186);
+pub const ACCENT: Color32 = rgb(52, 211, 196);
+pub const BORDER: Color32 = rgb(46, 46, 58);
 pub const RECORD: Color32 = rgb(236, 72, 82);
 pub const PLAYHEAD: Color32 = rgb(255, 255, 255);
 pub const MUTE_ON: Color32 = rgb(74, 150, 255);
@@ -47,25 +48,29 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
     let mut v = egui::Visuals::dark();
     v.window_fill = PANEL_BG;
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(9);
+    v.window_stroke = Stroke::new(1.0, rgb(58, 58, 72));
+    v.popup_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(150) };
     v.panel_fill = PANEL_BG;
     v.extreme_bg_color = WELL;
     v.faint_bg_color = rgb(36, 36, 42);
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(46, 200, 186, 70);
     v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
-    let radius = CornerRadius::same(6);
+    let radius = CornerRadius::same(7);
 
     v.widgets.noninteractive.bg_fill = PANEL_BG;
     v.widgets.noninteractive.weak_bg_fill = PANEL_BG;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, rgb(44, 44, 52));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.inactive.bg_fill = rgb(66, 66, 78);
+    v.widgets.inactive.bg_fill = rgb(70, 70, 86);
     v.widgets.inactive.weak_bg_fill = SURFACE;
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.hovered.bg_fill = SURFACE_HI;
     v.widgets.hovered.weak_bg_fill = SURFACE_HI;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, rgb(78, 78, 90));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, rgb(86, 86, 104));
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT);
     v.widgets.active.bg_fill = rgb(64, 64, 76);
     v.widgets.active.weak_bg_fill = rgb(64, 64, 76);
@@ -84,8 +89,9 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, egui::Visuals::dark());
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        s.spacing.button_padding = Vec2::new(8.0, 4.0);
-        s.spacing.interact_size.y = 24.0;
+        s.spacing.button_padding = Vec2::new(10.0, 5.0);
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.menu_margin = egui::Margin::same(8);
     });
 }
 
@@ -101,6 +107,8 @@ pub enum Icon {
     Redo,
     Metronome,
     Dots,
+    Trash,
+    Plus,
 }
 
 fn at(c: Pos2, x: f32, y: f32) -> Pos2 {
@@ -169,6 +177,24 @@ pub fn paint_icon(p: &Painter, r: Rect, icon: Icon, color: Color32) {
                 p.circle_filled(at(c, 0.0, y * h), h * 0.17, color);
             }
         }
+        Icon::Trash => {
+            p.line_segment([at(c, -h * 0.85, -h * 0.5), at(c, h * 0.85, -h * 0.5)], stroke);
+            p.add(Shape::line(
+                vec![at(c, -h * 0.3, -h * 0.5), at(c, -h * 0.3, -h * 0.85), at(c, h * 0.3, -h * 0.85), at(c, h * 0.3, -h * 0.5)],
+                stroke,
+            ));
+            p.add(Shape::line(
+                vec![at(c, -h * 0.6, -h * 0.5), at(c, -h * 0.5, h * 0.9), at(c, h * 0.5, h * 0.9), at(c, h * 0.6, -h * 0.5)],
+                stroke,
+            ));
+            for x in [-0.2, 0.2] {
+                p.line_segment([at(c, x * h, -h * 0.15), at(c, x * h, h * 0.6)], Stroke::new(1.2, color));
+            }
+        }
+        Icon::Plus => {
+            p.line_segment([at(c, -h * 0.7, 0.0), at(c, h * 0.7, 0.0)], Stroke::new(2.0, color));
+            p.line_segment([at(c, 0.0, -h * 0.7), at(c, 0.0, h * 0.7)], Stroke::new(2.0, color));
+        }
     }
 }
 
@@ -207,7 +233,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, active: bool) -> Resp
     } else {
         Color32::TRANSPARENT
     };
-    p.rect_filled(rect, 6.0, bg);
+    p.rect_filled(rect, 8.0, bg);
     let color = if active {
         ACCENT
     } else if resp.hovered() {
@@ -330,8 +356,9 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(CARD)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(10))
+        .corner_radius(CornerRadius::same(12))
+        .stroke(Stroke::new(1.0, BORDER))
+        .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(egui::RichText::new(title.to_uppercase()).size(10.0).strong().color(TEXT_DIM));
