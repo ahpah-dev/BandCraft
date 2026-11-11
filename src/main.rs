@@ -1,5 +1,8 @@
 //! BandCraft: a simple, loop-based music studio in pure Rust.
 
+// Hide the console window in release builds on Windows.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod dsp;
 mod engine;
